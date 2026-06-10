@@ -413,12 +413,14 @@ async function processAndNotifyGradings(rows, weekLabel, weekStart, weekEnd, not
     const gradedAt = col(row, 'date_graded', 'date_first_graded', 'date graded', 'graded_at', 'created_at');
     if (!gradedAt) return true;
     const ms = new Date(gradedAt).getTime();
+    if (isNaN(ms)) return true; // unparseable date — include it, export already scoped to this week
     return ms >= weekStartMs && ms <= weekEndMs;
   });
-  // Log grade_type distribution so we can tune later
+  // Log grade_type distribution and sample date_graded so we can tune filters
   const typeCounts = {};
+  const sampleDate = col(rows[0] || {}, 'date_graded', 'date_first_graded', 'date graded', 'graded_at');
   rows.forEach(r => { const t = col(r, 'grade_type', 'gradetype') || 'unknown'; typeCounts[t] = (typeCounts[t] || 0) + 1; });
-  console.log(`Week filter: ${rows.length} total -> ${filtered.length} in week. Grade types:`, JSON.stringify(typeCounts));
+  console.log(`Week filter: ${rows.length} total -> ${filtered.length} in week | sample date_graded: "${sampleDate}" | grade types:`, JSON.stringify(typeCounts));
 
   const teamData = {};
   let newCount = 0;
@@ -634,7 +636,11 @@ async function runQAPoll(opts = {}) {
       });
     }
     const top5 = allAgents.sort((a, b) => b.avg - a.avg).slice(0, 5);
-    await saveWeekHistory(startDate.split('T')[0], label, top5);
+    if (top5.length > 0) {
+      await saveWeekHistory(startDate.split('T')[0], label, top5);
+    } else {
+      console.log('No qualifying agents for history (all below MIN_GRADED_FOR_RANK or no data)');
+    }
 
     // Optional Friday weekly summary
     if (weeklySummary) {

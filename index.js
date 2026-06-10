@@ -41,6 +41,7 @@ let cachedQAData = {
   weekLabel: null,
   teams: {},
 };
+let cachedHistory = { weeks: [] };
 
 // ── GOOGLE AUTH (webcrypto pattern) ──────────────────────────────────────────
 function stripPem(raw) {
@@ -264,11 +265,9 @@ async function ensureQAHistorySheet() {
 
 async function saveWeekHistory(weekStart, weekLabel, top5) {
   try {
-    // Read existing rows to avoid duplicate writes for same week
     const rows = await sheetsGet('QA_History!A:A');
     const alreadyExists = rows.slice(1).some(r => r[0] === weekStart);
     if (alreadyExists) {
-      // Overwrite: find the row index and update it
       const rowIdx = rows.slice(1).findIndex(r => r[0] === weekStart) + 2;
       const token = await getGoogleAccessToken();
       await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${QA_SHEET_ID}/values/${encodeURIComponent(`QA_History!A${rowIdx}:D${rowIdx}`)}?valueInputOption=RAW`, {
@@ -280,8 +279,25 @@ async function saveWeekHistory(weekStart, weekLabel, top5) {
       await sheetsAppend('QA_History!A:D', [[weekStart, weekLabel, JSON.stringify(top5), new Date().toISOString()]]);
     }
     console.log('Week history saved:', weekLabel, '| top5:', top5.map(a => a.name).join(', '));
+    // Rebuild in-memory cache after saving
+    await loadHistoryIntoCache();
   } catch (e) {
     console.error('saveWeekHistory error:', e.message);
+  }
+}
+
+async function loadHistoryIntoCache() {
+  try {
+    const rows = await sheetsGet('QA_History!A:D');
+    const weekMap = {};
+    rows.slice(1).forEach(r => {
+      if (!r[0] || !r[1] || !r[2]) return;
+      weekMap[r[0]] = { weekStart: r[0], weekLabel: r[1], agents: JSON.parse(r[2] || '[]'), savedAt: r[3] || '' };
+    });
+    cachedHistory.weeks = Object.values(weekMap).sort((a, b) => new Date(b.weekStart) - new Date(a.weekStart));
+    console.log(`History cache loaded: ${cachedHistory.weeks.length} week(s)`);
+  } catch (e) {
+    console.error('loadHistoryIntoCache error:', e.message);
   }
 }
   if (!RIPPIT_TOKEN) { console.log('No RIPPIT_TOKEN — skipping agent team map load'); return; }
@@ -664,25 +680,9 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: Math.floor(process.uptime()), lastPoll: cachedQAData.updatedAt });
 });
 
-// History: all weeks grouped for accordion widget
-app.get('/qa/history', async (req, res) => {
-  try {
-    const rows = await sheetsGet('QA_History!A:D');
-    const weekMap = {};
-    rows.slice(1).forEach(r => {
-      if (!r[0] || !r[1] || !r[2]) return;
-      weekMap[r[0]] = {
-        weekStart: r[0],
-        weekLabel: r[1],
-        agents: JSON.parse(r[2] || '[]'),
-        savedAt: r[3] || '',
-      };
-    });
-    const weeks = Object.values(weekMap).sort((a, b) => new Date(b.weekStart) - new Date(a.weekStart));
-    res.json({ weeks });
-  } catch (e) {
-    res.json({ weeks: [], error: e.message });
-  }
+// History: all weeks grouped for accordion widget — served from in-memory cache
+app.get('/qa/history', (req, res) => {
+  res.json(cachedHistory);
 });
 
 // Full QA summary for KB widget
@@ -712,6 +712,7 @@ app.listen(PORT, async () => {
   console.log(`QA Bizee-Bot listening on port ${PORT}`);
   await ensureSheetHeaders();
   await ensureQAHistorySheet();
+  await loadHistoryIntoCache();
   await loadAgentTeamMap();
   // Initial poll after 8 seconds
   setTimeout(() => runQAPoll({ weeklySummary: false }), 8000);

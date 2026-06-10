@@ -14,6 +14,7 @@ const ZD_API_TOKEN        = process.env.ZENDESK_API_TOKEN;
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
 const GOOGLE_PRIVATE_KEY  = process.env.GOOGLE_PRIVATE_KEY;
 const QA_SHEET_ID         = process.env.QA_STATE_SHEET_ID;
+const QA_SHEET_TAB        = process.env.QA_SHEET_TAB || 'Sheet1';
 const PORT                = process.env.PORT || 3000;
 const TZ                  = 'America/Mexico_City';
 
@@ -103,7 +104,7 @@ async function sheetsAppend(range, values) {
 
 async function getNotifiedSet() {
   try {
-    const rows = await sheetsGet('QA_Notified!A:B');
+    const rows = await sheetsGet(`${QA_SHEET_TAB}!A:B`);
     const set = new Set();
     rows.slice(1).forEach(r => { // skip header row
       if (r[0] && r[1]) set.add(r[0] + '|' + r[1]);
@@ -117,9 +118,29 @@ async function getNotifiedSet() {
 
 async function markNotified(ticketId, agentEmail) {
   try {
-    await sheetsAppend('QA_Notified!A:C', [[ticketId, agentEmail, new Date().toISOString()]]);
+    await sheetsAppend(`${QA_SHEET_TAB}!A:C`, [[ticketId, agentEmail, new Date().toISOString()]]);
   } catch (e) {
     console.error('markNotified error:', e.message);
+  }
+}
+
+async function ensureSheetHeaders() {
+  try {
+    const rows = await sheetsGet(`${QA_SHEET_TAB}!A1:C1`);
+    if (rows.length && rows[0][0] === 'ticket_id') {
+      console.log('Sheet headers already set');
+      return;
+    }
+    const token = await getGoogleAccessToken();
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${QA_SHEET_ID}/values/${encodeURIComponent(QA_SHEET_TAB + '!A1:C1')}?valueInputOption=RAW`;
+    await fetch(url, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [['ticket_id', 'agent_email', 'notified_at']] }),
+    });
+    console.log('Sheet headers written to', QA_SHEET_TAB);
+  } catch (e) {
+    console.error('ensureSheetHeaders error:', e.message);
   }
 }
 
@@ -584,7 +605,7 @@ app.post('/qa/poll-now', async (req, res) => {
 // ── START ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`QA Bizee-Bot listening on port ${PORT}`);
-  // Load agent-team mapping from Rippit groups export
+  await ensureSheetHeaders();
   await loadAgentTeamMap();
   // Initial poll after 8 seconds
   setTimeout(() => runQAPoll({ weeklySummary: false }), 8000);

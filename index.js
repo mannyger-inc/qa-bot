@@ -300,6 +300,8 @@ async function loadHistoryIntoCache() {
     console.error('loadHistoryIntoCache error:', e.message);
   }
 }
+
+async function loadAgentTeamMap() {
   if (!RIPPIT_TOKEN) { console.log('No RIPPIT_TOKEN — skipping agent team map load'); return; }
   try {
     console.log('Loading agent-team map from Rippit groups export...');

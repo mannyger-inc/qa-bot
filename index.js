@@ -343,11 +343,24 @@ function formatScore(score) {
 }
 
 // ── NOTIFICATION LOGIC ────────────────────────────────────────────────────────
-async function processAndNotifyGradings(rows, weekLabel, notifiedSet) {
-  const teamData = {}; // key -> { total, count, agents: {} }
+async function processAndNotifyGradings(rows, weekLabel, weekStart, weekEnd, notifiedSet) {
+  const weekStartMs = new Date(weekStart).getTime();
+  const weekEndMs   = new Date(weekEnd).getTime();
+
+  // Filter to gradings that actually occurred this week and are not deleted
+  const filtered = rows.filter(row => {
+    if (col(row, 'is_deleted') === 'true' || col(row, 'is_deleted') === '1') return false;
+    const gradedAt = col(row, 'date_graded', 'date_first_graded', 'date graded', 'graded_at', 'created_at');
+    if (!gradedAt) return true;
+    const ms = new Date(gradedAt).getTime();
+    return ms >= weekStartMs && ms <= weekEndMs;
+  });
+  console.log(`Week filter: ${rows.length} total rows -> ${filtered.length} in current week`);
+
+  const teamData = {};
   let newCount = 0;
 
-  for (const row of rows) {
+  for (const row of filtered) {
     const ticketId   = col(row, 'ticket_id', 'ticketid', 'ticket id', 'external_id', 'ticket_external_id', 'zendesk_ticket_id', 'helpdesk_ticket_id');
     const agentEmail = col(row, 'agent_email', 'agentemail', 'agent email', 'email').toLowerCase();
     const agentName  = col(row, 'agent_name', 'agentname', 'agent name', 'agent') || agentEmail.split('@')[0];
@@ -525,7 +538,7 @@ async function runQAPoll(opts = {}) {
     const notifiedSet = await getNotifiedSet();
 
     // Process gradings, send per-ticket notifications
-    const teamData = await processAndNotifyGradings(rows, label, notifiedSet);
+    const teamData = await processAndNotifyGradings(rows, label, startDate, endDate, notifiedSet);
 
     // Update in-memory cache for KB endpoints
     cachedQAData.updatedAt = new Date().toISOString();

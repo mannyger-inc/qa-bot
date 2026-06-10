@@ -234,7 +234,10 @@ async function fetchExportRows(exportId) {
   if (!res.ok) throw new Error('CSV download HTTP ' + res.status);
   const text = await res.text();
   const rows = parseCSV(text);
-  console.log(`Parsed ${rows.length} rows. Sample columns:`, rows[0] ? Object.keys(rows[0]).join(', ') : 'none');
+  if (rows[0]) {
+    // Log ALL column names so we can verify field names
+    console.log(`Parsed ${rows.length} rows. All columns: ${Object.keys(rows[0]).join(' | ')}`);
+  }
   return rows;
 }
 
@@ -345,12 +348,20 @@ async function processAndNotifyGradings(rows, weekLabel, notifiedSet) {
   let newCount = 0;
 
   for (const row of rows) {
-    const ticketId   = col(row, 'ticket_id', 'ticketid', 'ticket id', 'external_id');
+    const ticketId   = col(row, 'ticket_id', 'ticketid', 'ticket id', 'external_id', 'ticket_external_id', 'zendesk_ticket_id', 'helpdesk_ticket_id');
     const agentEmail = col(row, 'agent_email', 'agentemail', 'agent email', 'email').toLowerCase();
     const agentName  = col(row, 'agent_name', 'agentname', 'agent name', 'agent') || agentEmail.split('@')[0];
     const graderName = col(row, 'grader_name', 'gradername', 'grader name', 'grader');
-    const rawScore   = col(row, 'score', 'total_score', 'total score', 'percentage', 'overall_score', 'overall score');
-    const score      = parseFloat(rawScore);
+
+    // Score: try direct percentage fields first, then calculate from rubric_score / max_rubric_score
+    let score = parseFloat(col(row, 'score', 'total_score', 'total score', 'percentage', 'overall_score', 'overall score', 'rubric_score', 'rubric score'));
+    if (isNaN(score)) {
+      const rubric    = parseFloat(col(row, 'rubric_score', 'rubric score'));
+      const maxRubric = parseFloat(col(row, 'max_rubric_score', 'max rubric score', 'max_score', 'max score'));
+      if (!isNaN(rubric) && !isNaN(maxRubric) && maxRubric > 0) {
+        score = (rubric / maxRubric) * 100;
+      }
+    }
 
     if (!agentEmail || isNaN(score)) continue;
 

@@ -657,6 +657,118 @@ async function runQAPoll(opts = {}) {
   }
 }
 
+// ── BACKFILL ──────────────────────────────────────────────────────────────────
+let backfillStatus = { running: false, current: 0, total: 0, done: 0, skipped: 0, message: 'Idle' };
+
+function getAllWeeksOf2026() {
+  const weeks = [];
+  // First Monday of 2026 is Jan 5
+  let mon = new Date('2026-01-05T06:00:00Z'); // noon UTC avoids DST edge cases
+  const now = new Date();
+  while (mon <= now) {
+    const sun = new Date(mon);
+    sun.setUTCDate(mon.getUTCDate() + 6);
+    sun.setUTCHours(23, 59, 59, 999);
+    const fmt = d => `${String(d.getUTCMonth()+1).padStart(2,'0')}/${String(d.getUTCDate()).padStart(2,'0')}/${d.getUTCFullYear()}`;
+    weeks.push({
+      startDate:  mon.toISOString(),
+      endDate:    sun.toISOString(),
+      weekStart:  mon.toISOString().split('T')[0],
+      label:      `${fmt(mon)} - ${fmt(sun)}`,
+    });
+    mon = new Date(mon);
+    mon.setUTCDate(mon.getUTCDate() + 7);
+  }
+  return weeks;
+}
+
+function buildTop5FromRows(rows, weekStartMs, weekEndMs) {
+  const teamData = {};
+  rows.forEach(row => {
+    if (col(row, 'is_deleted') === 'true' || col(row, 'is_deleted') === '1') return;
+    const gradedAt = col(row, 'date_graded', 'date_first_graded', 'date graded', 'graded_at', 'created_at');
+    if (gradedAt) {
+      const ms = new Date(gradedAt).getTime();
+      if (!isNaN(ms) && (ms < weekStartMs || ms > weekEndMs)) return;
+    }
+    const agentEmail = col(row, 'agent_email', 'agentemail', 'agent email', 'email').toLowerCase();
+    const agentName  = col(row, 'agent_name', 'agentname', 'agent name', 'agent') || agentEmail.split('@')[0];
+    const teamKey    = AGENT_TEAM_MAP[agentEmail];
+    if (!teamKey || !agentEmail) return;
+    let score = parseFloat(col(row, 'score', 'total_score', 'percentage', 'overall_score', 'rubric_score'));
+    if (isNaN(score)) {
+      const r = parseFloat(col(row, 'rubric_score')), m = parseFloat(col(row, 'max_rubric_score'));
+      if (!isNaN(r) && !isNaN(m) && m > 0) score = (r / m) * 100;
+    }
+    if (isNaN(score)) return;
+    if (!teamData[teamKey]) teamData[teamKey] = {};
+    if (!teamData[teamKey][agentEmail]) teamData[teamKey][agentEmail] = { name: agentName, teamKey, teamName: SUPERVISORS[teamKey]?.name || teamKey, total: 0, count: 0 };
+    teamData[teamKey][agentEmail].total += score;
+    teamData[teamKey][agentEmail].count += 1;
+  });
+  const all = [];
+  Object.values(teamData).forEach(agents => {
+    Object.values(agents).forEach(a => {
+      if (a.count >= MIN_GRADED_FOR_RANK) all.push({ name: a.name, teamKey: a.teamKey, teamName: a.teamName, avg: parseFloat((a.total / a.count).toFixed(1)), count: a.count });
+    });
+  });
+  return all.sort((a, b) => b.avg - a.avg).slice(0, 5);
+}
+
+async function runBackfill() {
+  if (backfillStatus.running) { console.log('Backfill already running'); return; }
+  const weeks = getAllWeeksOf2026();
+  backfillStatus = { running: true, current: 0, total: weeks.length, done: 0, skipped: 0, message: 'Loading existing weeks...' };
+  console.log(`Backfill starting: ${weeks.length} weeks from ${weeks[0].label} to ${weeks[weeks.length-1].label}`);
+
+  // Load already-saved week starts to skip re-processing
+  const existingRows = await sheetsGet('QA_History!A:A').catch(() => []);
+  const existingWeeks = new Set(existingRows.slice(1).map(r => r[0]).filter(Boolean));
+  console.log(`Backfill: ${existingWeeks.size} weeks already in history, will skip those`);
+
+  for (let i = 0; i < weeks.length; i++) {
+    const wk = weeks[i];
+    backfillStatus.current = i + 1;
+    backfillStatus.message = `[${i+1}/${weeks.length}] ${wk.label}`;
+
+    if (existingWeeks.has(wk.weekStart)) {
+      console.log(`Backfill: skip ${wk.label} (exists)`);
+      backfillStatus.skipped++;
+      continue;
+    }
+
+    try {
+      console.log(`Backfill: requesting export for ${wk.label}`);
+      const exportId = await requestRippitExport(wk.startDate, wk.endDate);
+      const rows = await fetchExportRows(exportId);
+      if (!rows.length) {
+        console.log(`Backfill: no rows for ${wk.label}`);
+        continue;
+      }
+      const top5 = buildTop5FromRows(rows, new Date(wk.startDate).getTime(), new Date(wk.endDate).getTime());
+      if (top5.length > 0) {
+        // Write directly to sheet without reloading cache on every week
+        await sheetsAppend('QA_History!A:D', [[wk.weekStart, wk.label, JSON.stringify(top5), new Date().toISOString()]]);
+        backfillStatus.done++;
+        console.log(`Backfill: saved ${wk.label} — top: ${top5[0]?.name} ${top5[0]?.avg}%`);
+      } else {
+        console.log(`Backfill: no qualifying agents for ${wk.label}`);
+      }
+    } catch (e) {
+      console.error(`Backfill error for ${wk.label}:`, e.message);
+    }
+
+    // Pause between Rippit export requests to avoid rate limiting
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  // Reload cache once at the end
+  await loadHistoryIntoCache();
+  backfillStatus = { running: false, current: weeks.length, total: weeks.length, done: backfillStatus.done, skipped: backfillStatus.skipped, message: `Complete — ${backfillStatus.done} weeks saved` };
+  console.log('Backfill complete:', backfillStatus.message);
+  await slackDM(MANNY_SLACK_ID, `:white_check_mark: *QA Backfill complete* — ${backfillStatus.done} weeks saved, ${backfillStatus.skipped} skipped`);
+}
+
 // ── CRON SCHEDULE ─────────────────────────────────────────────────────────────
 // Poll every 2 hours Mon-Sat, skip outside 8am-8pm GDL
 cron.schedule('0 */2 * * 1-6', async () => {
@@ -713,6 +825,19 @@ app.post('/qa/poll-now', async (req, res) => {
   const weekly = req.body && req.body.weeklySummary === true;
   res.json({ ok: true, message: `Poll started${weekly ? ' (with weekly summary)' : ''}` });
   setImmediate(() => runQAPoll({ weeklySummary: weekly }));
+});
+
+// Backfill all of 2026
+app.post('/qa/backfill', (req, res) => {
+  if (backfillStatus.running) {
+    return res.json({ ok: false, message: 'Backfill already running', status: backfillStatus });
+  }
+  res.json({ ok: true, message: `Backfill started — ${getAllWeeksOf2026().length} weeks to process` });
+  setImmediate(() => runBackfill());
+});
+
+app.get('/qa/backfill-status', (req, res) => {
+  res.json(backfillStatus);
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────

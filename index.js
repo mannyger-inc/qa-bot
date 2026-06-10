@@ -242,7 +242,48 @@ async function fetchExportRows(exportId) {
   return rows;
 }
 
-async function loadAgentTeamMap() {
+async function ensureQAHistorySheet() {
+  try {
+    await sheetsGet('QA_History!A1:D1');
+    console.log('QA_History sheet exists');
+  } catch (e) {
+    try {
+      const token = await getGoogleAccessToken();
+      await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${QA_SHEET_ID}:batchUpdate`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requests: [{ addSheet: { properties: { title: 'QA_History' } } }] }),
+      });
+      await sheetsAppend('QA_History!A:D', [['week_start', 'week_label', 'top5_json', 'saved_at']]);
+      console.log('QA_History sheet created');
+    } catch (err) {
+      console.error('ensureQAHistorySheet error:', err.message);
+    }
+  }
+}
+
+async function saveWeekHistory(weekStart, weekLabel, top5) {
+  try {
+    // Read existing rows to avoid duplicate writes for same week
+    const rows = await sheetsGet('QA_History!A:A');
+    const alreadyExists = rows.slice(1).some(r => r[0] === weekStart);
+    if (alreadyExists) {
+      // Overwrite: find the row index and update it
+      const rowIdx = rows.slice(1).findIndex(r => r[0] === weekStart) + 2;
+      const token = await getGoogleAccessToken();
+      await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${QA_SHEET_ID}/values/${encodeURIComponent(`QA_History!A${rowIdx}:D${rowIdx}`)}?valueInputOption=RAW`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ values: [[weekStart, weekLabel, JSON.stringify(top5), new Date().toISOString()]] }),
+      });
+    } else {
+      await sheetsAppend('QA_History!A:D', [[weekStart, weekLabel, JSON.stringify(top5), new Date().toISOString()]]);
+    }
+    console.log('Week history saved:', weekLabel, '| top5:', top5.map(a => a.name).join(', '));
+  } catch (e) {
+    console.error('saveWeekHistory error:', e.message);
+  }
+}
   if (!RIPPIT_TOKEN) { console.log('No RIPPIT_TOKEN — skipping agent team map load'); return; }
   try {
     console.log('Loading agent-team map from Rippit groups export...');
@@ -351,15 +392,15 @@ async function processAndNotifyGradings(rows, weekLabel, weekStart, weekEnd, not
   // Filter to gradings that actually occurred this week and are not deleted
   const filtered = rows.filter(row => {
     if (col(row, 'is_deleted') === 'true' || col(row, 'is_deleted') === '1') return false;
-    // Only standard agent_qa gradings — excludes calibration and grader_qa rows
-    const gradeType = col(row, 'grade_type', 'gradetype', 'type').toLowerCase();
-    if (gradeType && gradeType !== 'agent_qa' && gradeType !== '') return false;
     const gradedAt = col(row, 'date_graded', 'date_first_graded', 'date graded', 'graded_at', 'created_at');
     if (!gradedAt) return true;
     const ms = new Date(gradedAt).getTime();
     return ms >= weekStartMs && ms <= weekEndMs;
   });
-  console.log(`Week filter: ${rows.length} total -> ${filtered.length} after date+type filter`);
+  // Log grade_type distribution so we can tune later
+  const typeCounts = {};
+  rows.forEach(r => { const t = col(r, 'grade_type', 'gradetype') || 'unknown'; typeCounts[t] = (typeCounts[t] || 0) + 1; });
+  console.log(`Week filter: ${rows.length} total -> ${filtered.length} in week. Grade types:`, JSON.stringify(typeCounts));
 
   const teamData = {};
   let newCount = 0;
@@ -564,6 +605,19 @@ async function runQAPoll(opts = {}) {
       };
     }
 
+    // Compute top5 for history (only agents with enough graded tickets)
+    const allAgents = [];
+    for (const [teamKey, data] of Object.entries(teamData)) {
+      const sup = SUPERVISORS[teamKey];
+      Object.entries(data.agents).forEach(([, a]) => {
+        if (a.count >= MIN_GRADED_FOR_RANK) {
+          allAgents.push({ name: a.name, teamKey, teamName: sup?.name || teamKey, avg: parseFloat((a.total / a.count).toFixed(1)), count: a.count });
+        }
+      });
+    }
+    const top5 = allAgents.sort((a, b) => b.avg - a.avg).slice(0, 5);
+    await saveWeekHistory(startDate.split('T')[0], label, top5);
+
     // Optional Friday weekly summary
     if (weeklySummary) {
       console.log('Sending weekly team summary...');
@@ -610,6 +664,27 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: Math.floor(process.uptime()), lastPoll: cachedQAData.updatedAt });
 });
 
+// History: all weeks grouped for accordion widget
+app.get('/qa/history', async (req, res) => {
+  try {
+    const rows = await sheetsGet('QA_History!A:D');
+    const weekMap = {};
+    rows.slice(1).forEach(r => {
+      if (!r[0] || !r[1] || !r[2]) return;
+      weekMap[r[0]] = {
+        weekStart: r[0],
+        weekLabel: r[1],
+        agents: JSON.parse(r[2] || '[]'),
+        savedAt: r[3] || '',
+      };
+    });
+    const weeks = Object.values(weekMap).sort((a, b) => new Date(b.weekStart) - new Date(a.weekStart));
+    res.json({ weeks });
+  } catch (e) {
+    res.json({ weeks: [], error: e.message });
+  }
+});
+
 // Full QA summary for KB widget
 app.get('/qa/summary', (req, res) => {
   res.json(cachedQAData);
@@ -636,6 +711,7 @@ app.post('/qa/poll-now', async (req, res) => {
 app.listen(PORT, async () => {
   console.log(`QA Bizee-Bot listening on port ${PORT}`);
   await ensureSheetHeaders();
+  await ensureQAHistorySheet();
   await loadAgentTeamMap();
   // Initial poll after 8 seconds
   setTimeout(() => runQAPoll({ weeklySummary: false }), 8000);

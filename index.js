@@ -20,8 +20,9 @@ const TZ                  = 'America/Mexico_City';
 
 const MANNY_SLACK_ID      = 'U09AV9NJQQY';
 const MANNY_EMAIL         = 'manuel.r@incfile.com';
-const LOW_SCORE_THRESHOLD = 80;
-const MAESTROQA_URL       = 'https://app.maestroqa.com/performance';
+const LOW_SCORE_THRESHOLD  = 80;
+const MIN_GRADED_FOR_RANK  = 3;   // minimum graded tickets to appear in top 5
+const MAESTROQA_URL        = 'https://app.maestroqa.com/performance';
 
 const SUPERVISORS = {
   jewel:  { slackId: 'U09A1QG8N5B', email: 'jewel.f@incfile.com',   name: 'Jewel'  },
@@ -350,12 +351,15 @@ async function processAndNotifyGradings(rows, weekLabel, weekStart, weekEnd, not
   // Filter to gradings that actually occurred this week and are not deleted
   const filtered = rows.filter(row => {
     if (col(row, 'is_deleted') === 'true' || col(row, 'is_deleted') === '1') return false;
+    // Only standard agent_qa gradings — excludes calibration and grader_qa rows
+    const gradeType = col(row, 'grade_type', 'gradetype', 'type').toLowerCase();
+    if (gradeType && gradeType !== 'agent_qa' && gradeType !== '') return false;
     const gradedAt = col(row, 'date_graded', 'date_first_graded', 'date graded', 'graded_at', 'created_at');
     if (!gradedAt) return true;
     const ms = new Date(gradedAt).getTime();
     return ms >= weekStartMs && ms <= weekEndMs;
   });
-  console.log(`Week filter: ${rows.length} total rows -> ${filtered.length} in current week`);
+  console.log(`Week filter: ${rows.length} total -> ${filtered.length} after date+type filter`);
 
   const teamData = {};
   let newCount = 0;
@@ -550,11 +554,13 @@ async function runQAPoll(opts = {}) {
         name: sup?.name || teamKey,
         avg: data.count > 0 ? parseFloat((data.total / data.count).toFixed(1)) : null,
         gradedTickets: data.count,
-        agents: Object.values(data.agents).map(a => ({
-          name: a.name,
-          avg: parseFloat((a.total / a.count).toFixed(1)),
-          count: a.count,
-        })).sort((a, b) => b.avg - a.avg),
+        agents: Object.values(data.agents)
+          .filter(a => a.count >= MIN_GRADED_FOR_RANK)
+          .map(a => ({
+            name: a.name,
+            avg: parseFloat((a.total / a.count).toFixed(1)),
+            count: a.count,
+          })).sort((a, b) => b.avg - a.avg),
       };
     }
 
